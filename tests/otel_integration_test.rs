@@ -90,11 +90,15 @@ async fn test_otel_integration() {
 
         let upstream_trace_id = "baf7651916cd43dd8448eb211c80319c";
         let upstream_span_id = "e7ad6b7169203331";
-        let traceparent = format!("00-{upstream_trace_id}-{upstream_span_id}-01");
+        let traceparent = format!("00-{upstream_trace_id}-{upstream_span_id}-03");
 
         let request = Request::builder()
             .method("GET")
             .uri("/health")
+            .header("x-request-id", "router-trace-test-001")
+            .header("x-request-id", "router-trace-test-002")
+            .header("x-session-id", "session.prod:42")
+            .header("x-session-id", "session.later")
             .header("traceparent", &traceparent)
             .body(axum::body::Body::empty())
             .unwrap();
@@ -129,6 +133,11 @@ async fn test_otel_integration() {
             "Span parent_span_id should match upstream"
         );
 
+        assert!(http_span
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "http.response.status_code"
+                && kv.value == opentelemetry::Value::I64(200)));
         // Verify span attributes
         let attrs: std::collections::HashMap<String, String> = http_span
             .attributes
@@ -150,6 +159,13 @@ async fn test_otel_integration() {
             attrs.contains_key("http.response.status_code"),
             "Should record http.response.status_code"
         );
+        assert_eq!(
+            attrs.get("request.id").map(|s| s.as_str()),
+            Some("router-trace-test-001"),
+            "Should use the request.id attribute shared with LMDeploy"
+        );
+        assert_eq!(attrs["session.id"], "session.prod:42");
+        assert_eq!(attrs["trace.context.missing"], "false");
         eprintln!("PASS: Section 1 - Span attributes on health route");
     }
 
@@ -157,7 +173,7 @@ async fn test_otel_integration() {
     // Section 2: Trace propagation to backend via chat completions
     // ==================================================================
     {
-        let (_exporter, _provider, _guard) = setup_otel_harness();
+        let (exporter, _provider, _guard) = setup_otel_harness();
 
         mock_worker::clear_captured_requests(port);
 
@@ -172,7 +188,7 @@ async fn test_otel_integration() {
 
         let upstream_trace_id = "aaf7651916cd43dd8448eb211c80319c";
         let upstream_span_id = "c7ad6b7169203331";
-        let traceparent = format!("00-{upstream_trace_id}-{upstream_span_id}-01");
+        let traceparent = format!("00-{upstream_trace_id}-{upstream_span_id}-03");
 
         let request = Request::builder()
             .method("POST")
@@ -189,9 +205,19 @@ async fn test_otel_integration() {
             ))
             .unwrap();
 
-        let response = app.oneshot(request).await.unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        // Both request spans must finish while the HTTP connection pool is still alive.
+        let spans = exporter.get_finished_spans().unwrap();
+        for kind in [
+            opentelemetry::trace::SpanKind::Server,
+            opentelemetry::trace::SpanKind::Client,
+        ] {
+            assert!(spans.iter().any(|span| span.span_kind == kind
+                && span.span_context.trace_id().to_string() == upstream_trace_id));
+        }
 
         // Verify backend received fresh trace context
         let captured = mock_worker::get_captured_requests(port);
@@ -201,6 +227,7 @@ async fn test_otel_integration() {
         );
 
         let backend_req = &captured[0];
+        assert!(!backend_req.headers.contains_key("x-request-id"));
 
         // The backend should have traceparent with the SAME trace_id but a
         // DIFFERENT span_id (the router's span, not the upstream's)
@@ -228,7 +255,38 @@ async fn test_otel_integration() {
             backend_baggage.contains("userId=alice"),
             "baggage should contain userId=alice, got: {backend_baggage}"
         );
+
         eprintln!("PASS: Section 2 - Trace propagation to backend");
+    }
+
+    // Missing business IDs and private session hints must not become span attributes.
+    {
+        use tower_http::trace::MakeSpan;
+        let (exporter, provider, _guard) = setup_otel_harness();
+        for value in [None, Some("invalid"), Some("sk-credential-example")] {
+            let mut req = Request::builder()
+                .uri("/v1/messages")
+                .header("x-session-affinity", "private-value")
+                .header("x-openclaw-session-key", "lower-priority");
+            if let Some(id) = value {
+                req = req.header("x-request-id", id);
+            }
+            drop(vllm_router_rs::middleware::RequestSpan.make_span(&req.body(()).unwrap()));
+        }
+        provider.force_flush();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 3);
+        for span in spans {
+            assert!(span
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "trace.context.missing"
+                    && kv.value == opentelemetry::Value::Bool(true)));
+            assert!(!span
+                .attributes
+                .iter()
+                .any(|kv| matches!(kv.key.as_str(), "session.id" | "request.id")));
+        }
     }
 
     // Clean up

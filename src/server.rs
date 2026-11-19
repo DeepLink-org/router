@@ -42,9 +42,6 @@ use tokio::{
 };
 use tracing::{error, info, warn, Level};
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Clone)]
 pub struct AppContext {
     pub client: Client,

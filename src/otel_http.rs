@@ -1,5 +1,5 @@
 use axum::http::HeaderMap;
-use tracing::{field::Empty, info_span, Instrument, Span};
+use tracing::{field::Empty, info_span, instrument::WithSubscriber, Dispatch, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use url::Url;
 
@@ -25,14 +25,16 @@ impl PreparedClientRequest {
         let response = if span.is_none() {
             request.send().await
         } else {
-            request.send().instrument(span.clone()).await
+            // Propagation headers are already set. Hyper's keep-alive tasks can
+            // outlive this request and must not retain its client or server span.
+            request.send().with_subscriber(Dispatch::none()).await
         };
 
         match response {
             Ok(response) => {
                 if !span.is_disabled() {
                     let status = response.status();
-                    span.record("http.response.status_code", status.as_u16());
+                    span.record("http.response.status_code", i64::from(status.as_u16()));
 
                     if status.is_server_error() {
                         span.set_status(opentelemetry::trace::Status::error(format!(
@@ -46,8 +48,8 @@ impl PreparedClientRequest {
             }
             Err(error) => {
                 if !span.is_disabled() {
-                    let message = error.to_string();
-                    span.record("error", message.as_str());
+                    let message = "backend request failed";
+                    span.record("error", true);
                     span.set_status(opentelemetry::trace::Status::error(message));
                 }
 
@@ -63,6 +65,22 @@ pub fn prepare_client_request(
     options: ClientRequestOptions<'_>,
 ) -> PreparedClientRequest {
     let span = if crate::otel_trace::is_otel_enabled() {
+        // Only static inference routes belong in trace metadata. Other backend paths can
+        // contain user-supplied response IDs or query parameters.
+        let route = options.route.filter(|route| {
+            matches!(
+                *route,
+                "/v1/chat/completions"
+                    | "/v1/completions"
+                    | "/generate"
+                    | "/v1/messages"
+                    | "/v1/models"
+                    | "/v1/responses"
+                    | "/v1/embeddings"
+                    | "/rerank"
+                    | "/v1/rerank"
+            )
+        });
         let span = info_span!(
             target: "otel_trace",
             "http_client_request",
@@ -70,11 +88,12 @@ pub fn prepare_client_request(
             otel.name = %format_args!(
                 "{} {}",
                 options.method,
-                options.route.unwrap_or(options.url)
+                route.unwrap_or("backend")
             ),
             http.request.method = %options.method,
             http.route = Empty,
-            url.full = %options.url,
+            request.id = Empty,
+            session.id = Empty,
             server.address = Empty,
             server.port = Empty,
             vllm.request_phase = Empty,
@@ -82,11 +101,14 @@ pub fn prepare_client_request(
             error = Empty,
         );
 
-        if let Some(route) = options.route {
+        if let Some(route) = route {
             span.record("http.route", route);
         }
         if let Some(request_phase) = options.request_phase {
             span.record("vllm.request_phase", request_phase);
+        }
+        if let Some(headers) = incoming_headers {
+            crate::otel_trace::record_correlation(&span, headers);
         }
         record_server_address(&span, options.url);
 

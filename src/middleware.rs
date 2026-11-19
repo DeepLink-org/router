@@ -151,16 +151,13 @@ impl<B> MakeSpan<B> for RequestSpan {
             return Span::none();
         }
 
-        // Don't try to extract request ID here - it won't be available yet
-        // The RequestIdLayer runs after TraceLayer creates the span
-
         // Use MatchedPath (route template) when available for low-cardinality
         // span names, falling back to the raw URI path otherwise.
         let route = request
             .extensions()
             .get::<axum::extract::MatchedPath>()
             .map(axum::extract::MatchedPath::as_str);
-        let path_for_name = route.unwrap_or(request_path);
+        let path_for_name = route.unwrap_or("unmatched");
 
         let span = info_span!(
             target: "otel_trace",
@@ -169,15 +166,18 @@ impl<B> MakeSpan<B> for RequestSpan {
             otel.name = %format_args!("{} {}", request.method(), path_for_name),
             http.request.method = %request.method(),
             http.route = Empty,
-            url.path = %request_path,
+            url.path = Empty,
             http.response.status_code = Empty,
-            request_id = Empty,  // Will be set later
+            request.id = Empty,
+            session.id = Empty,
+            trace.context.missing = Empty,
             latency_ms = Empty,
             error = Empty,
         );
 
         if let Some(route) = route {
             span.record("http.route", route);
+            span.record("url.path", route);
         }
 
         // Extract W3C TraceContext (traceparent/tracestate) from incoming request
@@ -185,8 +185,14 @@ impl<B> MakeSpan<B> for RequestSpan {
         // router's span as a child of the upstream caller's trace.
         if !span.is_disabled() {
             let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-                propagator.extract(&opentelemetry_http::HeaderExtractor(request.headers()))
+                propagator.extract(&crate::otel_trace::TraceHeaders::new(request.headers()))
             });
+            use opentelemetry::trace::TraceContextExt;
+            span.record(
+                "trace.context.missing",
+                !parent_cx.span().span_context().is_valid(),
+            );
+            crate::otel_trace::record_correlation(&span, request.headers());
             span.set_parent(parent_cx);
         }
 
@@ -199,14 +205,8 @@ impl<B> MakeSpan<B> for RequestSpan {
 pub struct RequestLogger;
 
 impl<B> OnRequest<B> for RequestLogger {
-    fn on_request(&mut self, request: &Request<B>, span: &Span) {
+    fn on_request(&mut self, _request: &Request<B>, span: &Span) {
         let _enter = span.enter();
-
-        // Try to get the request ID from extensions
-        // This will work if RequestIdLayer has already run
-        if let Some(request_id) = request.extensions().get::<RequestId>() {
-            span.record("request_id", request_id.0.as_str());
-        }
 
         // Log the request start
         debug!(
@@ -236,7 +236,7 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         if !span.is_disabled() {
             // Record OTel semantic convention attributes only when a real span exists.
-            span.record("http.response.status_code", status.as_u16());
+            span.record("http.response.status_code", i64::from(status.as_u16()));
             span.record("latency_ms", latency.as_secs_f64() * 1000.0);
 
             if status.is_server_error() {
@@ -296,8 +296,8 @@ impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
 
         if !span.is_disabled() {
             span.record("latency_ms", latency.as_secs_f64() * 1000.0);
-            span.record("error", message.as_str());
-            span.set_status(opentelemetry::trace::Status::error(message));
+            span.record("error", true);
+            span.set_status(opentelemetry::trace::Status::error("HTTP request failed"));
         }
     }
 }
