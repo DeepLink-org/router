@@ -91,6 +91,9 @@ lmdeploy-router \
 
 See [Load Balancing Policies](docs/load_balancing/README.md) for session extraction, TTL, and route coverage.
 
+See [OpenTelemetry tracing](docs/observability/opentelemetry.md) for trace propagation and
+Collector setup.
+
 #### Prefill-Decode Disaggregation
 ```bash
 # When vLLM runs the NIXL connector, prefill/decode URLs are required.
