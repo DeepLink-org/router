@@ -157,23 +157,6 @@ impl<B> MakeSpan<B> for RequestSpan {
             .get::<axum::extract::MatchedPath>()
             .map(axum::extract::MatchedPath::as_str);
         let lmdeploy = crate::otel_trace::is_lmdeploy_router();
-        let inference = lmdeploy
-            && request.method() == axum::http::Method::POST
-            && matches!(
-                route,
-                Some(
-                    "/generate"
-                        | "/inference/v1/generate"
-                        | "/rerank"
-                        | "/v1/rerank"
-                        | "/v1/chat/completions"
-                        | "/v1/completions"
-                        | "/v1/embeddings"
-                        | "/v1/messages"
-                        | "/v1/responses"
-                )
-            );
-
         let span = info_span!(
             target: "otel_trace",
             "http_request",
@@ -181,7 +164,6 @@ impl<B> MakeSpan<B> for RequestSpan {
             otel.name = Empty,
             inference.engine = Empty,
             inference.role = Empty,
-            envoy.error = Empty,
             http.request.method = %request.method(),
             http.route = Empty,
             url.path = Empty,
@@ -193,7 +175,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             error = Empty,
         );
 
-        if inference {
+        if lmdeploy && crate::otel_trace::is_inference_post(request.method().as_str(), route) {
             span.record("otel.name", "model.router");
         } else {
             span.record(
@@ -273,9 +255,6 @@ impl<B> OnResponse<B> for ResponseLogger {
             span.record("http.response.status_code", i64::from(status.as_u16()));
             span.record("latency_ms", latency.as_secs_f64() * 1000.0);
 
-            if crate::otel_trace::is_lmdeploy_router() {
-                span.record("envoy.error", status.is_server_error());
-            }
             if status.is_server_error() {
                 span.set_status(opentelemetry::trace::Status::error(format!(
                     "HTTP {}",
@@ -334,9 +313,6 @@ impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
         if !span.is_disabled() {
             span.record("latency_ms", latency.as_secs_f64() * 1000.0);
             span.record("error", true);
-            if crate::otel_trace::is_lmdeploy_router() {
-                span.record("envoy.error", true);
-            }
             span.set_status(opentelemetry::trace::Status::error("HTTP request failed"));
         }
     }

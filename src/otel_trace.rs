@@ -264,6 +264,24 @@ pub(crate) fn is_lmdeploy_router() -> bool {
     LMDEPLOY_ROUTER.load(Ordering::Relaxed)
 }
 
+pub(crate) fn is_inference_post(method: &str, route: Option<&str>) -> bool {
+    method == "POST"
+        && matches!(
+            route,
+            Some(
+                "/generate"
+                    | "/inference/v1/generate"
+                    | "/rerank"
+                    | "/v1/rerank"
+                    | "/v1/chat/completions"
+                    | "/v1/completions"
+                    | "/v1/embeddings"
+                    | "/v1/messages"
+                    | "/v1/responses"
+            )
+        )
+}
+
 fn router_resource(resource: Resource) -> Resource {
     let instance_id = service_instance_id(&resource);
     let service_name = resource
@@ -508,6 +526,11 @@ pub fn shutdown_otel() {
 /// When OTel is disabled, this is a no-op.
 #[inline]
 pub fn inject_trace_context_http(headers: &mut HeaderMap) {
+    inject_request_context(headers, None);
+}
+
+pub(crate) fn inject_request_context(headers: &mut HeaderMap, incoming: Option<&HeaderMap>) {
+    use opentelemetry::trace::TraceContextExt;
     if !is_otel_enabled() {
         return;
     }
@@ -528,6 +551,18 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) {
     }
 
     global::get_text_map_propagator(|propagator| {
-        propagator.inject_context(&context, &mut HeaderInjector(headers));
+        // An excluded route has no local SERVER span. Preserve its valid upstream parent.
+        let upstream = incoming
+            .filter(|_| !context.span().span_context().is_valid())
+            .map(|source| {
+                propagator.extract_with_context(
+                    &opentelemetry::Context::new(),
+                    &TraceHeaders::new(source),
+                )
+            });
+        propagator.inject_context(
+            upstream.as_ref().unwrap_or(&context),
+            &mut HeaderInjector(headers),
+        );
     });
 }

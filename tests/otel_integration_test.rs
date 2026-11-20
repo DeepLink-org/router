@@ -212,40 +212,28 @@ async fn test_otel_integration() {
         assert_eq!(response.status(), StatusCode::OK);
         let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
 
-        // Both request spans must finish while the HTTP connection pool is still alive.
+        // The Router span must finish while the backend connection remains pooled.
         let spans = exporter.get_finished_spans().unwrap();
-        for kind in [
-            opentelemetry::trace::SpanKind::Server,
-            opentelemetry::trace::SpanKind::Client,
+        let [server] = spans.as_slice() else {
+            panic!("Expected one Router span, got {}", spans.len())
+        };
+        assert_eq!(server.name, "model.router");
+        assert_eq!(server.span_kind, opentelemetry::trace::SpanKind::Server);
+        assert_eq!(server.parent_span_id.to_string(), upstream_span_id);
+        for (key, value) in [
+            ("inference.engine", "lmdeploy"),
+            ("inference.role", "router"),
+            ("http.route", "/v1/chat/completions"),
         ] {
-            let span = spans
-                .iter()
-                .find(|s| {
-                    s.span_kind == kind
-                        && s.span_context.trace_id().to_string() == upstream_trace_id
-                })
-                .unwrap();
-            if kind == opentelemetry::trace::SpanKind::Server {
-                assert_eq!(span.name, "model.router");
-                for (key, value) in [
-                    ("inference.engine", opentelemetry::Value::from("lmdeploy")),
-                    ("inference.role", opentelemetry::Value::from("router")),
-                    ("envoy.error", opentelemetry::Value::Bool(false)),
-                ] {
-                    assert!(span
-                        .attributes
-                        .iter()
-                        .any(|a| a.key.as_str() == key && a.value == value));
-                }
-            } else {
-                assert_eq!(span.name, "POST /v1/chat/completions");
-            }
-            assert!(span
+            assert!(server
                 .attributes
                 .iter()
-                .any(|kv| kv.key.as_str() == "http.route"
-                    && kv.value.as_str() == "/v1/chat/completions"));
+                .any(|a| a.key.as_str() == key && a.value.as_str() == value));
         }
+        assert!(!server
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "envoy.error"));
 
         // Verify backend received fresh trace context
         let captured = mock_worker::get_captured_requests(port);
@@ -269,10 +257,7 @@ async fn test_otel_integration() {
             parts[1], upstream_trace_id,
             "trace_id should be preserved from upstream"
         );
-        assert_ne!(
-            parts[2], upstream_span_id,
-            "span_id should be the router's own span, not the upstream's"
-        );
+        assert_eq!(parts[2], server.span_context.span_id().to_string());
 
         // Baggage should be propagated
         let backend_baggage = backend_req
@@ -302,23 +287,10 @@ async fn test_otel_integration() {
                     .any(|a| a.key.as_str() == "http.route" && a.value.as_str() == "/v1/messages")
             })
             .collect();
-        assert_eq!(messages.len(), 2);
-        let server = messages
-            .iter()
-            .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Server)
-            .unwrap();
-        let client = messages
-            .iter()
-            .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
-            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let server = messages[0];
         assert_eq!(server.name, "model.router");
-        assert_eq!(client.name, "POST /v1/messages");
         assert_eq!(server.parent_span_id.to_string(), upstream_span_id);
-        assert_eq!(client.parent_span_id, server.span_context.span_id());
-        assert_eq!(
-            client.span_context.trace_id(),
-            server.span_context.trace_id()
-        );
         assert!(server
             .attributes
             .iter()
@@ -357,6 +329,28 @@ async fn test_otel_integration() {
         }
     }
 
+    // A deliberately excluded route has no local span to inject.
+    {
+        let (_exporter, _provider, _guard) = setup_otel_harness();
+        let client = reqwest::Client::new();
+        for flag in ["03", "00"] {
+            let prefix = "00-aaf7651916cd43dd8448eb211c80319c-c7ad6b7169203331-";
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("traceparent", format!("{prefix}{flag}").parse().unwrap());
+            let request = vllm_router_rs::otel_http::propagate_trace_headers(
+                client.post(&worker_url),
+                Some(&headers),
+            )
+            .build()
+            .unwrap();
+            let expected_flag = if flag == "03" { "01" } else { "00" };
+            assert_eq!(
+                request.headers()["traceparent"].to_str().unwrap(),
+                format!("{prefix}{expected_flag}")
+            );
+        }
+    }
+
     // The same inference endpoint retains its HTTP span name for other Router services.
     std::env::set_var("OTEL_SERVICE_NAME", "vllm-router");
     {
@@ -386,6 +380,11 @@ async fn test_otel_integration() {
             .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Server)
             .unwrap();
         assert_eq!(server.name, "POST /v1/messages");
+        let client = spans
+            .iter()
+            .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
+            .unwrap();
+        assert_eq!(client.parent_span_id, server.span_context.span_id());
         assert!(!server
             .attributes
             .iter()

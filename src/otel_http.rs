@@ -22,12 +22,12 @@ impl PreparedClientRequest {
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
         let Self { request, span } = self;
 
-        let response = if span.is_none() {
-            request.send().await
-        } else {
+        let response = if crate::otel_trace::is_otel_enabled() {
             // Propagation headers are already set. Hyper's keep-alive tasks can
             // outlive this request and must not retain its client or server span.
             request.send().with_subscriber(Dispatch::none()).await
+        } else {
+            request.send().await
         };
 
         match response {
@@ -64,7 +64,11 @@ pub fn prepare_client_request(
     incoming_headers: Option<&HeaderMap>,
     options: ClientRequestOptions<'_>,
 ) -> PreparedClientRequest {
-    let span = if crate::otel_trace::is_otel_enabled() {
+    // In LMDeploy inference traffic the worker and its phases share model.router as parent.
+    let span = if crate::otel_trace::is_otel_enabled()
+        && !(crate::otel_trace::is_lmdeploy_router()
+            && crate::otel_trace::is_inference_post(options.method, options.route))
+    {
         // Only static inference routes belong in trace metadata. Other backend paths can
         // contain user-supplied response IDs or query parameters.
         let route = options.route.filter(|route| {
@@ -141,7 +145,7 @@ pub fn propagate_trace_headers(
 ) -> reqwest::RequestBuilder {
     if crate::otel_trace::is_otel_enabled() {
         let mut trace_headers = HeaderMap::new();
-        crate::otel_trace::inject_trace_context_http(&mut trace_headers);
+        crate::otel_trace::inject_request_context(&mut trace_headers, headers);
         for (name, value) in trace_headers.iter() {
             request = request.header(name, value);
         }
