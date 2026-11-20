@@ -64,6 +64,7 @@ fn test_router_config(worker_url: &str) -> RouterConfig {
 /// global state conflicts.
 #[tokio::test(flavor = "current_thread")]
 async fn test_otel_integration() {
+    std::env::set_var("OTEL_SERVICE_NAME", "lmdeploy-router");
     // Start a real backend server
     let mut worker = MockWorker::new(MockWorkerConfig::default());
     let worker_url = worker.start().await.expect("Failed to start mock worker");
@@ -224,7 +225,21 @@ async fn test_otel_integration() {
                         && s.span_context.trace_id().to_string() == upstream_trace_id
                 })
                 .unwrap();
-            assert_eq!(span.name, "POST /v1/chat/completions");
+            if kind == opentelemetry::trace::SpanKind::Server {
+                assert_eq!(span.name, "model.router");
+                for (key, value) in [
+                    ("inference.engine", opentelemetry::Value::from("lmdeploy")),
+                    ("inference.role", opentelemetry::Value::from("router")),
+                    ("envoy.error", opentelemetry::Value::Bool(false)),
+                ] {
+                    assert!(span
+                        .attributes
+                        .iter()
+                        .any(|a| a.key.as_str() == key && a.value == value));
+                }
+            } else {
+                assert_eq!(span.name, "POST /v1/chat/completions");
+            }
             assert!(span
                 .attributes
                 .iter()
@@ -281,7 +296,11 @@ async fn test_otel_integration() {
         let spans = exporter.get_finished_spans().unwrap();
         let messages: Vec<_> = spans
             .iter()
-            .filter(|s| s.name == "POST /v1/messages")
+            .filter(|s| {
+                s.attributes
+                    .iter()
+                    .any(|a| a.key.as_str() == "http.route" && a.value.as_str() == "/v1/messages")
+            })
             .collect();
         assert_eq!(messages.len(), 2);
         let server = messages
@@ -292,6 +311,8 @@ async fn test_otel_integration() {
             .iter()
             .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
             .unwrap();
+        assert_eq!(server.name, "model.router");
+        assert_eq!(client.name, "POST /v1/messages");
         assert_eq!(server.parent_span_id.to_string(), upstream_span_id);
         assert_eq!(client.parent_span_id, server.span_context.span_id());
         assert_eq!(
@@ -334,6 +355,41 @@ async fn test_otel_integration() {
                 .iter()
                 .any(|kv| matches!(kv.key.as_str(), "session.id" | "request.id")));
         }
+    }
+
+    // The same inference endpoint retains its HTTP span name for other Router services.
+    std::env::set_var("OTEL_SERVICE_NAME", "vllm-router");
+    {
+        let (exporter, _provider, _guard) = setup_otel_harness();
+        let router = RouterFactory::create_regular_router(std::slice::from_ref(&worker_url), &ctx)
+            .await
+            .unwrap();
+        let app = create_test_app(
+            std::sync::Arc::from(router),
+            reqwest::Client::new(),
+            &config,
+        );
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let server = spans
+            .iter()
+            .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Server)
+            .unwrap();
+        assert_eq!(server.name, "POST /v1/messages");
+        assert!(!server
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "envoy.error"));
     }
 
     // Clean up

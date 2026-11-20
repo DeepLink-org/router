@@ -35,6 +35,7 @@ use crate::config::TraceConfig;
 /// inject_trace_context_http). Only set to true after both the OTel layer
 /// and subscriber are installed via `activate_otel`.
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static LMDEPLOY_ROUTER: AtomicBool = AtomicBool::new(false);
 static PROVIDER: Mutex<Option<TracerProvider>> = Mutex::new(None);
 static EXCLUDED_PATHS: OnceLock<Box<[String]>> = OnceLock::new();
 
@@ -83,6 +84,7 @@ where
 pub struct PreparedOtel {
     provider: TracerProvider,
     tracer: SdkTracer,
+    lmdeploy_router: bool,
     excluded_paths: Box<[String]>,
 }
 
@@ -101,6 +103,7 @@ impl PreparedOtel {
         Self {
             provider,
             tracer,
+            lmdeploy_router: is_lmdeploy_resource(&Resource::default()),
             excluded_paths: excluded_paths.into_boxed_slice(),
         }
     }
@@ -253,6 +256,14 @@ pub(crate) fn record_correlation(span: &tracing::Span, headers: &HeaderMap) {
     }
 }
 
+fn is_lmdeploy_resource(resource: &Resource) -> bool {
+    resource.get(Key::new("service.name")) == Some("lmdeploy-router".into())
+}
+
+pub(crate) fn is_lmdeploy_router() -> bool {
+    LMDEPLOY_ROUTER.load(Ordering::Relaxed)
+}
+
 fn router_resource(resource: Resource) -> Resource {
     let instance_id = service_instance_id(&resource);
     let service_name = resource
@@ -282,11 +293,16 @@ fn router_resource(resource: Resource) -> Resource {
             })
             .map(|(k, v)| KeyValue::new(k.clone(), v.clone())),
     );
-    resource.merge(&Resource::new(vec![
-        KeyValue::new("service.name", service_name),
+    let mut identity = vec![
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
         KeyValue::new("service.instance.id", instance_id),
-    ]))
+    ];
+    if service_name == "lmdeploy-router" {
+        identity.push(KeyValue::new("inference.engine", "lmdeploy"));
+        identity.push(KeyValue::new("inference.role", "router"));
+    }
+    identity.push(KeyValue::new("service.name", service_name));
+    resource.merge(&Resource::new(identity))
 }
 
 /// Build OTel provider and tracer without mutating global state.
@@ -329,6 +345,7 @@ pub fn prepare_otel(trace_config: &TraceConfig) -> Result<PreparedOtel> {
     // Resource::default(); only fill Router identity fields and SDK metadata.
     let resource = router_resource(Resource::default());
 
+    let lmdeploy_router = is_lmdeploy_resource(&resource);
     let provider = TracerProvider::builder()
         .with_sampler(parent_based_sampler(trace_config.sampling_ratio))
         .with_span_processor(span_processor)
@@ -340,6 +357,7 @@ pub fn prepare_otel(trace_config: &TraceConfig) -> Result<PreparedOtel> {
     Ok(PreparedOtel {
         provider,
         tracer,
+        lmdeploy_router,
         excluded_paths: trace_config.excluded_paths.clone().into_boxed_slice(),
     })
 }
@@ -432,6 +450,7 @@ pub fn activate_otel(prepared: PreparedOtel) {
     let PreparedOtel {
         provider,
         excluded_paths,
+        lmdeploy_router,
         ..
     } = prepared;
 
@@ -443,12 +462,17 @@ pub fn activate_otel(prepared: PreparedOtel) {
     let _ = EXCLUDED_PATHS.set(excluded_paths);
     let _ = global::set_tracer_provider(provider.clone());
     *PROVIDER.lock().unwrap() = Some(provider);
+    LMDEPLOY_ROUTER.store(lmdeploy_router, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Release);
     tracing::info!("[tracing] OpenTelemetry tracing enabled");
 }
 
 /// Mark OpenTelemetry tracing as enabled (for tests that manage their own provider).
 pub fn mark_otel_enabled() {
+    LMDEPLOY_ROUTER.store(
+        is_lmdeploy_resource(&Resource::default()),
+        Ordering::Relaxed,
+    );
     ENABLED.store(true, Ordering::Release);
 }
 

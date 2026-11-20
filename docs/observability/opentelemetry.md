@@ -29,25 +29,13 @@ retain their existing protocol semantics.
 The gateway can supply a normalized session ID for affinity routing. Health probes and LMDeploy
 worker registration endpoints are excluded by default. Span export uses the batch processor.
 
-### Collector normalization
+### Exported span names
 
-For the LMDeploy deployment above, run this transform in the traces pipeline before the
-platform's span-name filter. It maps inbound inference requests to `model.router` and keeps the
-actual method and route as attributes. Include backend CLIENT spans in the platform allowlist
-when retaining downstream spans that reference them as parents. The gateway derives
-`envoy.error` from status and copies the inference engine and role from resource attributes.
+With `OTEL_SERVICE_NAME=lmdeploy-router`, the Router exports inbound inference POSTs as
+`model.router` (SERVER). Each carries the matched HTTP route template, method, response status,
+`inference.engine=lmdeploy` and `inference.role=router`. The boolean `envoy.error` reflects
+an HTTP 5xx or a request failure observed by the Router. The gateway can apply its own signals.
 
-```yaml
-processors:
-  transform/lmdeploy-router:
-    trace_statements:
-      - context: span
-        statements:
-          - >-
-            set(name, "model.router")
-            where resource.attributes["service.name"] == "lmdeploy-router"
-            and kind == SPAN_KIND_SERVER
-            and attributes["http.request.method"] == "POST"
-            and attributes["http.route"] != nil
-            and IsMatch(attributes["http.route"], "^/(generate|inference/v1/generate|rerank|v1/(chat/completions|completions|embeddings|messages|rerank|responses))$")
-```
+Other routes and backend CLIENT spans retain their HTTP names. Keep backend CLIENT spans when
+filtering downstream spans that reference them as parents. The local Collector can forward
+these spans directly. Register the exported names with the gateway before deployment.
