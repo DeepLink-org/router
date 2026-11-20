@@ -151,8 +151,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             return Span::none();
         }
 
-        // Use MatchedPath (route template) when available for low-cardinality
-        // span names, falling back to the raw URI path otherwise.
+        // Use the registered template so IDs and query strings never enter span metadata.
         let route = request
             .extensions()
             .get::<axum::extract::MatchedPath>()

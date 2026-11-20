@@ -118,6 +118,8 @@ async fn test_otel_integration() {
             .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Server)
             .expect("Should have a SpanKind::Server span");
 
+        assert_eq!(http_span.name, "GET /health");
+
         // Verify trace_id matches upstream
         let expected_trace_id = opentelemetry::trace::TraceId::from_hex(upstream_trace_id).unwrap();
         assert_eq!(
@@ -215,8 +217,19 @@ async fn test_otel_integration() {
             opentelemetry::trace::SpanKind::Server,
             opentelemetry::trace::SpanKind::Client,
         ] {
-            assert!(spans.iter().any(|span| span.span_kind == kind
-                && span.span_context.trace_id().to_string() == upstream_trace_id));
+            let span = spans
+                .iter()
+                .find(|s| {
+                    s.span_kind == kind
+                        && s.span_context.trace_id().to_string() == upstream_trace_id
+                })
+                .unwrap();
+            assert_eq!(span.name, "POST /v1/chat/completions");
+            assert!(span
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "http.route"
+                    && kv.value.as_str() == "/v1/chat/completions"));
         }
 
         // Verify backend received fresh trace context
@@ -255,6 +268,40 @@ async fn test_otel_integration() {
             backend_baggage.contains("userId=alice"),
             "baggage should contain userId=alice, got: {backend_baggage}"
         );
+
+        // /v1/messages follows the transparent forwarding path.
+        let request = Request::post("/v1/messages?private=query")
+            .header("traceparent", &traceparent)
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let messages: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "POST /v1/messages")
+            .collect();
+        assert_eq!(messages.len(), 2);
+        let server = messages
+            .iter()
+            .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Server)
+            .unwrap();
+        let client = messages
+            .iter()
+            .find(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
+            .unwrap();
+        assert_eq!(server.parent_span_id.to_string(), upstream_span_id);
+        assert_eq!(client.parent_span_id, server.span_context.span_id());
+        assert_eq!(
+            client.span_context.trace_id(),
+            server.span_context.trace_id()
+        );
+        assert!(server
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "url.path" && kv.value.as_str() == "/v1/messages"));
 
         eprintln!("PASS: Section 2 - Trace propagation to backend");
     }

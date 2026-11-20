@@ -1079,6 +1079,19 @@ pub fn build_app_with_request_tracing(
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins));
 
+    // Messages uses transparent forwarding. Trace its inference POST on the same
+    // handler and preserve the existing fallback for other methods.
+    let base_app = if enable_transparent_proxy && enable_request_tracing {
+        base_app.route(
+            "/v1/messages",
+            post(transparent_proxy_handler)
+                .layer(middleware::create_logging_layer())
+                .fallback(transparent_proxy_handler),
+        )
+    } else {
+        base_app
+    };
+
     // Choose fallback based on transparent proxy mode
     if enable_transparent_proxy {
         base_app
