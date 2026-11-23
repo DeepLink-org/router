@@ -1,15 +1,18 @@
 # OpenTelemetry tracing
 
-Enable tracing in the Router process and point it at the local Collector's OTLP/gRPC receiver.
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` in the deployment environment to the selected Collector's
+OTLP/gRPC receiver URL. The address belongs to the deployment, not the Router implementation.
+Configure the Router process separately from the backend API process.
 
 ```bash
 export OTEL_SERVICE_NAME=lmdeploy-router
 export OTEL_RESOURCE_ATTRIBUTES='inference.engine=lmdeploy,inference.role=router'
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
-lmdeploy-router --enable-trace --worker-urls http://127.0.0.1:23333
+: "${OTEL_EXPORTER_OTLP_ENDPOINT:?Set the Collector OTLP/gRPC endpoint in the deployment environment}"
+export OTEL_EXPORTER_OTLP_ENDPOINT
+# Add --enable-trace to the existing Router startup command.
 ```
 
-For LMDeploy dynamic worker registration, add `--enable-trace` to the existing Router command.
+Keep the existing worker URLs or LMDeploy dynamic worker registration configuration.
 Configure the API Server process separately with `OTEL_SERVICE_NAME=lmdeploy-full` and the same
 Collector endpoint. The Collector exports traces to the gateway using OTLP/gRPC over TLS.
 
