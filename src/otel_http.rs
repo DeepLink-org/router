@@ -1,4 +1,5 @@
 use axum::http::HeaderMap;
+use opentelemetry::trace::TraceContextExt;
 use tracing::{field::Empty, info_span, instrument::WithSubscriber, Dispatch, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use url::Url;
@@ -69,6 +70,17 @@ pub fn prepare_client_request(
         && !(crate::otel_trace::is_lmdeploy_router()
             && crate::otel_trace::is_inference_post(options.method, options.route))
     {
+        let parent = Span::current().context();
+        let upstream = incoming_headers
+            .filter(|_| !parent.span().span_context().is_valid())
+            .map(|headers| {
+                opentelemetry::global::get_text_map_propagator(|propagator| {
+                    propagator.extract_with_context(
+                        &opentelemetry::Context::new(),
+                        &crate::otel_trace::TraceHeaders::new(headers),
+                    )
+                })
+            });
         // Only static inference routes belong in trace metadata. Other backend paths can
         // contain user-supplied response IDs or query parameters.
         let route = options.route.filter(|route| {
@@ -104,6 +116,10 @@ pub fn prepare_client_request(
             http.response.status_code = Empty,
             error = Empty,
         );
+
+        if let Some(upstream) = upstream {
+            span.set_parent(upstream);
+        }
 
         if let Some(route) = route {
             span.record("http.route", route);

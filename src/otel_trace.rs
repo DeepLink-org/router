@@ -161,6 +161,7 @@ fn parent_based_sampler(sampling_ratio: f64) -> Sampler {
 pub(crate) struct TraceHeaders<'a> {
     headers: &'a HeaderMap,
     parent: Option<std::borrow::Cow<'a, str>>,
+    state: Option<String>,
 }
 
 impl<'a> TraceHeaders<'a> {
@@ -193,8 +194,48 @@ impl<'a> TraceHeaders<'a> {
                 }
                 Some(std::borrow::Cow::Borrowed(s))
             });
-        Self { headers, parent }
+        let state = headers
+            .get("tracestate")
+            .and_then(|value| value.to_str().ok())
+            .and_then(bounded_tracestate);
+        Self {
+            headers,
+            parent,
+            state,
+        }
     }
+}
+
+fn bounded_tracestate(value: &str) -> Option<String> {
+    let members: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if members.len() > 32 || members.iter().any(|s| !safe_metadata(s)) {
+        return None;
+    }
+    let pairs: Option<Vec<_>> = members.iter().map(|s| s.split_once('=')).collect();
+    let pairs = pairs?;
+    let mut keys = std::collections::HashSet::new();
+    if pairs.iter().any(|(key, _)| !keys.insert(*key)) {
+        return None;
+    }
+    opentelemetry::trace::TraceState::from_key_value(pairs).ok()?;
+    // The deep-chain contract narrows W3C's 32 entries to eight and 512 bytes.
+    // Keep complete leftmost entries instead of dropping all vendor state.
+    let mut state = String::new();
+    for member in members.iter().take(8) {
+        let separator = usize::from(!state.is_empty());
+        if state.len() + separator + member.len() > 512 {
+            break;
+        }
+        if separator != 0 {
+            state.push(',');
+        }
+        state.push_str(member);
+    }
+    (!state.is_empty()).then_some(state)
 }
 
 impl opentelemetry::propagation::Extractor for TraceHeaders<'_> {
@@ -202,13 +243,10 @@ impl opentelemetry::propagation::Extractor for TraceHeaders<'_> {
         if key == "traceparent" {
             return self.parent.as_deref();
         }
-        let value = self.headers.get(key)?.to_str().ok()?;
-        if key == "tracestate"
-            && (value.len() > 512 || value.split(',').count() > 8 || !safe_metadata(value))
-        {
-            return None;
+        if key == "tracestate" {
+            return self.state.as_deref();
         }
-        Some(value)
+        self.headers.get(key)?.to_str().ok()
     }
 
     fn keys(&self) -> Vec<&str> {
@@ -298,16 +336,34 @@ fn router_resource(resource: Resource) -> Resource {
         resource
             .iter()
             .filter(|(k, v)| {
-                matches!(
-                    k.as_str(),
-                    "deployment.environment"
-                        | "inference.engine"
-                        | "inference.role"
-                        | "k8s.cluster.name"
-                        | "k8s.namespace.name"
-                        | "k8s.node.name"
-                        | "k8s.pod.name"
-                ) && safe_metadata(&v.to_string())
+                !matches!(
+                    k.as_str().to_ascii_lowercase().as_str(),
+                    "authorization"
+                        | "x-api-key"
+                        | "api_key"
+                        | "apikey"
+                        | "cookie"
+                        | "set-cookie"
+                        | "http.request.body"
+                        | "http.response.body"
+                        | "request.body"
+                        | "response.body"
+                        | "gen_ai.prompt"
+                        | "gen_ai.completion"
+                        | "llm.prompt"
+                        | "llm.completion"
+                        | "prompt"
+                        | "completion"
+                        | "password"
+                ) && safe_metadata(k.as_str())
+                    && match v {
+                        opentelemetry::Value::String(_)
+                        | opentelemetry::Value::Bool(_)
+                        | opentelemetry::Value::I64(_) => true,
+                        opentelemetry::Value::F64(value) => value.is_finite(),
+                        _ => false,
+                    }
+                    && safe_metadata(&v.to_string())
             })
             .map(|(k, v)| KeyValue::new(k.clone(), v.clone())),
     );
@@ -385,7 +441,68 @@ mod tests {
     use opentelemetry::{Key, KeyValue};
     use opentelemetry_sdk::Resource;
 
-    use super::router_resource;
+    use super::{bounded_tracestate, router_resource};
+
+    #[test]
+    fn vendor_state_keeps_complete_entries_within_contract_limits() {
+        for count in [1, 8, 9, 32] {
+            let entries: Vec<_> = (0..count).map(|i| format!("v{i}=value")).collect();
+            assert_eq!(
+                bounded_tracestate(&entries.join(",")),
+                Some(entries[..count.min(8)].join(","))
+            );
+        }
+        let large = format!("a={},b={},c=1", "x".repeat(250), "y".repeat(250));
+        assert_eq!(bounded_tracestate(&large), Some(large));
+        let over = format!("a={},b={},c=longvalue", "x".repeat(250), "y".repeat(250));
+        assert_eq!(
+            bounded_tracestate(&over).unwrap(),
+            over.rsplit_once(',').unwrap().0
+        );
+        for invalid in [
+            "a=1,a=2".to_string(),
+            "bad".into(),
+            "a=Bearer token".into(),
+            (0..33)
+                .map(|i| format!("v{i}=1"))
+                .collect::<Vec<_>>()
+                .join(","),
+        ] {
+            assert!(bounded_tracestate(&invalid).is_none());
+        }
+        assert_eq!(bounded_tracestate("a=1, b=2"), Some("a=1,b=2".into()));
+    }
+
+    #[test]
+    fn router_resource_retains_standard_metadata_without_secrets() {
+        let keys = [
+            "service.namespace",
+            "deployment.environment.name",
+            "k8s.pod.uid",
+            "telemetry.sdk.name",
+        ];
+        let mut attrs: Vec<_> = keys
+            .iter()
+            .map(|key| KeyValue::new(*key, "metadata"))
+            .collect();
+        attrs.extend([
+            KeyValue::new("authorization", "private"),
+            KeyValue::new("custom.secret", "Bearer token"),
+            KeyValue::new(
+                "custom.array",
+                opentelemetry::Value::Array(opentelemetry::Array::I64(vec![1, 2])),
+            ),
+            KeyValue::new("custom.invalid_number", f64::NAN),
+        ]);
+        let resource = router_resource(Resource::new(attrs));
+        for key in keys {
+            assert_eq!(resource.get(Key::new(key)).unwrap().to_string(), "metadata");
+        }
+        assert!(resource.get(Key::new("authorization")).is_none());
+        assert!(resource.get(Key::new("custom.secret")).is_none());
+        assert!(resource.get(Key::new("custom.array")).is_none());
+        assert!(resource.get(Key::new("custom.invalid_number")).is_none());
+    }
 
     #[test]
     fn router_resource_preserves_configured_service_and_role() {
@@ -535,7 +652,7 @@ pub(crate) fn inject_request_context(headers: &mut HeaderMap, incoming: Option<&
         return;
     }
 
-    let context = tracing::Span::current().context();
+    let mut context = tracing::Span::current().context();
 
     struct HeaderInjector<'a>(&'a mut HeaderMap);
 
@@ -551,18 +668,38 @@ pub(crate) fn inject_request_context(headers: &mut HeaderMap, incoming: Option<&
     }
 
     global::get_text_map_propagator(|propagator| {
-        // An excluded route has no local SERVER span. Preserve its valid upstream parent.
+        let span = context.span();
+        let current = span.span_context();
         let upstream = incoming
-            .filter(|_| !context.span().span_context().is_valid())
+            .filter(|_| {
+                !current.is_valid()
+                    || (!current.is_sampled() && current.trace_state().header().is_empty())
+            })
             .map(|source| {
                 propagator.extract_with_context(
                     &opentelemetry::Context::new(),
                     &TraceHeaders::new(source),
                 )
             });
-        propagator.inject_context(
-            upstream.as_ref().unwrap_or(&context),
-            &mut HeaderInjector(headers),
-        );
+        if let Some(upstream) = upstream {
+            let parent = upstream.span();
+            let parent = parent.span_context();
+            if !current.is_valid() {
+                // An excluded route can have no local SERVER span.
+                context = upstream.clone();
+            } else if parent.trace_id() == current.trace_id() {
+                // tracing-opentelemetry 0.28 drops tracestate on a Drop sampling
+                // decision. Preserve validated vendor state without changing IDs
+                // or the upstream sampling decision.
+                context = context.with_remote_span_context(opentelemetry::trace::SpanContext::new(
+                    current.trace_id(),
+                    current.span_id(),
+                    current.trace_flags(),
+                    current.is_remote(),
+                    parent.trace_state().clone(),
+                ));
+            }
+        }
+        propagator.inject_context(&context, &mut HeaderInjector(headers));
     });
 }

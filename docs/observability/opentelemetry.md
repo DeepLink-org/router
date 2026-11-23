@@ -19,6 +19,9 @@ starts a root with `trace.context.missing=true`.
 
 Set `service.instance.id` in `OTEL_RESOURCE_ATTRIBUTES` to supply an instance ID. Otherwise the
 Router uses its Kubernetes pod identity and PID, or generates a UUID at startup.
+Safe scalar SDK and configured resource metadata is preserved, including `service.namespace`,
+`deployment.environment.name`, `k8s.pod.uid` and `telemetry.sdk.*`. The gateway controls which
+additional resource fields it retains. Request bodies and credentials are excluded.
 
 Request spans record `request.id` from a safe inbound `x-request-id` (16–64 ASCII letters, digits,
 underscores or hyphens). Repeated correlation headers use the first field. Missing or invalid
@@ -27,6 +30,10 @@ retain their existing protocol semantics.
 `session.id` uses the explicit session header, or the OpenClaw session key when affinity is absent.
 The gateway can supply a normalized session ID for affinity routing. Health probes and LMDeploy
 worker registration endpoints are excluded by default. Span export uses the batch processor.
+For excluded routes that still forward an HTTP request, the backend CLIENT span inherits the
+incoming parent and sampling decision. Valid `tracestate` is forwarded as whole leftmost entries,
+limited to eight vendors and 512 bytes, including for unsampled requests. No local probability
+sampling option is added; the gateway owns tail sampling.
 
 ### Exported span names
 
