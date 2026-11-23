@@ -336,41 +336,29 @@ fn router_resource(resource: Resource) -> Resource {
         resource
             .iter()
             .filter(|(k, v)| {
-                !matches!(
-                    k.as_str().to_ascii_lowercase().as_str(),
-                    "authorization"
-                        | "x-api-key"
-                        | "api_key"
-                        | "apikey"
-                        | "cookie"
-                        | "set-cookie"
-                        | "http.request.body"
-                        | "http.response.body"
-                        | "request.body"
-                        | "response.body"
-                        | "gen_ai.prompt"
-                        | "gen_ai.completion"
-                        | "llm.prompt"
-                        | "llm.completion"
-                        | "prompt"
-                        | "completion"
-                        | "password"
-                ) && safe_metadata(k.as_str())
-                    && match v {
-                        opentelemetry::Value::String(_)
-                        | opentelemetry::Value::Bool(_)
-                        | opentelemetry::Value::I64(_) => true,
-                        opentelemetry::Value::F64(value) => value.is_finite(),
-                        _ => false,
-                    }
-                    && safe_metadata(&v.to_string())
+                // Environment and SDK detectors must not inject request IDs or
+                // raw affinity into the exported resource. Expand only with
+                // fields agreed in the platform resource contract.
+                matches!(
+                    k.as_str(),
+                    "deployment.environment"
+                        | "k8s.cluster.name"
+                        | "k8s.namespace.name"
+                        | "k8s.pod.name"
+                        | "k8s.node.name"
+                        | "inference.engine"
+                        | "inference.role"
+                ) && match v {
+                    opentelemetry::Value::String(_)
+                    | opentelemetry::Value::Bool(_)
+                    | opentelemetry::Value::I64(_) => true,
+                    opentelemetry::Value::F64(value) => value.is_finite(),
+                    _ => false,
+                } && safe_metadata(&v.to_string())
             })
             .map(|(k, v)| KeyValue::new(k.clone(), v.clone())),
     );
-    let mut identity = vec![
-        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-        KeyValue::new("service.instance.id", instance_id),
-    ];
+    let mut identity = vec![KeyValue::new("service.instance.id", instance_id)];
     if service_name == "lmdeploy-router" {
         identity.push(KeyValue::new("inference.engine", "lmdeploy"));
         identity.push(KeyValue::new("inference.role", "router"));
@@ -415,8 +403,7 @@ pub fn prepare_otel(trace_config: &TraceConfig) -> Result<PreparedOtel> {
         .with_batch_config(batch_config)
         .build();
 
-    // Keep standard OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME values from
-    // Resource::default(); only fill Router identity fields and SDK metadata.
+    // Filter SDK/environment resource attributes before filling Router identity.
     let resource = router_resource(Resource::default());
 
     let lmdeploy_router = is_lmdeploy_resource(&resource);
@@ -474,12 +461,13 @@ mod tests {
     }
 
     #[test]
-    fn router_resource_retains_standard_metadata_without_secrets() {
+    fn router_resource_keeps_only_platform_fields_without_request_metadata() {
         let keys = [
-            "service.namespace",
-            "deployment.environment.name",
-            "k8s.pod.uid",
-            "telemetry.sdk.name",
+            "deployment.environment",
+            "k8s.cluster.name",
+            "k8s.namespace.name",
+            "k8s.pod.name",
+            "k8s.node.name",
         ];
         let mut attrs: Vec<_> = keys
             .iter()
@@ -494,6 +482,23 @@ mod tests {
             ),
             KeyValue::new("custom.invalid_number", f64::NAN),
         ]);
+        let omitted = [
+            "session.affinity",
+            "SESSION.AFFINITY",
+            "session.affinity_hashed",
+            "session.id",
+            "request.id",
+            "custom.metadata",
+            "service.namespace",
+            "deployment.environment.name",
+            "k8s.pod.uid",
+            "telemetry.sdk.name",
+        ];
+        attrs.extend(
+            omitted
+                .iter()
+                .map(|key| KeyValue::new(*key, "private-resource-value")),
+        );
         let resource = router_resource(Resource::new(attrs));
         for key in keys {
             assert_eq!(resource.get(Key::new(key)).unwrap().to_string(), "metadata");
@@ -502,6 +507,13 @@ mod tests {
         assert!(resource.get(Key::new("custom.secret")).is_none());
         assert!(resource.get(Key::new("custom.array")).is_none());
         assert!(resource.get(Key::new("custom.invalid_number")).is_none());
+        for key in omitted {
+            assert!(
+                resource.get(Key::new(key)).is_none(),
+                "unexpected resource field: {key}"
+            );
+        }
+        assert_eq!(resource.iter().count(), keys.len() + 2);
     }
 
     #[test]

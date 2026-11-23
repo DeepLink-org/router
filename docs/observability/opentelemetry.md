@@ -22,9 +22,12 @@ starts a root with `trace.context.missing=true`.
 
 Set `service.instance.id` in `OTEL_RESOURCE_ATTRIBUTES` to supply an instance ID. Otherwise the
 Router uses its Kubernetes pod identity and PID, or generates a UUID at startup.
-Safe scalar SDK and configured resource metadata is preserved, including `service.namespace`,
-`deployment.environment.name`, `k8s.pod.uid` and `telemetry.sdk.*`. The gateway controls which
-additional resource fields it retains. Request bodies and credentials are excluded.
+SDK and configured resource metadata is restricted to `service.name`, `service.instance.id`,
+`deployment.environment`, `k8s.cluster.name`, `k8s.namespace.name`, `k8s.pod.name`,
+`k8s.node.name`, `inference.engine` and `inference.role`, with scalar and privacy checks.
+Other fields, including raw affinity and request/session IDs injected through resource environment
+variables, are omitted before export. Request/session IDs come from accepted request headers.
+Additional resource fields require an agreed platform contract update before being allowed here.
 
 Request spans record `request.id` from a safe inbound `x-request-id` (16–64 ASCII letters, digits,
 underscores or hyphens). Repeated correlation headers use the first field. Missing or invalid
