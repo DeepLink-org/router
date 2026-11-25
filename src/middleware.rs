@@ -9,7 +9,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
-use tower_http::classify::ServerErrorsFailureClass;
+use tower_http::classify::{ClassifiedResponse, ClassifyEos, ClassifyResponse, SharedClassifier};
 use tower_http::trace::{MakeSpan, OnFailure, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -284,22 +284,71 @@ impl<B> OnResponse<B> for ResponseLogger {
     }
 }
 
-/// Custom on_failure handler for pre-response errors (e.g. connection drops).
+/// Classify HTTP errors while retaining the classifier for response-body failures.
+#[derive(Clone, Debug)]
+pub struct HttpFailureClassifier;
+
+#[derive(Debug)]
+pub enum HttpFailure {
+    StatusCode(StatusCode),
+    ServiceError(String),
+    BodyError(String),
+}
+
+impl ClassifyResponse for HttpFailureClassifier {
+    type FailureClass = HttpFailure;
+    type ClassifyEos = Self;
+
+    fn classify_response<B>(
+        self,
+        response: &axum::http::Response<B>,
+    ) -> ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
+        if response.status().is_server_error() {
+            ClassifiedResponse::Ready(Err(HttpFailure::StatusCode(response.status())))
+        } else if !crate::otel_trace::is_otel_enabled() {
+            ClassifiedResponse::Ready(Ok(()))
+        } else {
+            ClassifiedResponse::RequiresEos(self)
+        }
+    }
+
+    fn classify_error<E>(self, error: &E) -> Self::FailureClass
+    where
+        E: std::fmt::Display + 'static,
+    {
+        HttpFailure::ServiceError(error.to_string())
+    }
+}
+
+impl ClassifyEos for HttpFailureClassifier {
+    type FailureClass = HttpFailure;
+
+    fn classify_eos(
+        self,
+        _trailers: Option<&axum::http::HeaderMap>,
+    ) -> Result<(), Self::FailureClass> {
+        Ok(())
+    }
+
+    fn classify_error<E>(self, error: &E) -> Self::FailureClass
+    where
+        E: std::fmt::Display + 'static,
+    {
+        HttpFailure::BodyError(error.to_string())
+    }
+}
+
+/// Custom on_failure handler for service and response-body errors.
 #[derive(Clone, Debug, Default)]
 pub struct FailureLogger;
 
-impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
-    fn on_failure(
-        &mut self,
-        failure: ServerErrorsFailureClass,
-        latency: std::time::Duration,
-        span: &Span,
-    ) {
+impl OnFailure<HttpFailure> for FailureLogger {
+    fn on_failure(&mut self, failure: HttpFailure, latency: std::time::Duration, span: &Span) {
         let message = match &failure {
-            ServerErrorsFailureClass::StatusCode(code) => {
+            HttpFailure::StatusCode(code) => {
                 format!("response failed with status {code}")
             }
-            ServerErrorsFailureClass::Error(err) => {
+            HttpFailure::ServiceError(err) | HttpFailure::BodyError(err) => {
                 format!("request failed: {err}")
             }
         };
@@ -311,7 +360,12 @@ impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
         );
 
         if !span.is_disabled() {
-            span.record("latency_ms", latency.as_secs_f64() * 1000.0);
+            // tower-http resets its body timer after every poll. That value is
+            // not request latency. Responses (including 5xx) already recorded
+            // header latency in on_response; only a service error lacks it.
+            if matches!(failure, HttpFailure::ServiceError(_)) {
+                span.record("latency_ms", latency.as_secs_f64() * 1000.0);
+            }
             span.record("error", true);
             span.set_status(opentelemetry::trace::Status::error("HTTP request failed"));
         }
@@ -321,7 +375,7 @@ impl OnFailure<ServerErrorsFailureClass> for FailureLogger {
 /// Create a configured TraceLayer for HTTP logging
 /// Note: Actual request/response logging with request IDs is done in RequestIdService
 pub fn create_logging_layer() -> TraceLayer<
-    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    SharedClassifier<HttpFailureClassifier>,
     RequestSpan,
     RequestLogger,
     ResponseLogger,
@@ -329,7 +383,7 @@ pub fn create_logging_layer() -> TraceLayer<
     (),
     FailureLogger,
 > {
-    TraceLayer::new_for_http()
+    TraceLayer::new(SharedClassifier::new(HttpFailureClassifier))
         .make_span_with(RequestSpan)
         .on_request(RequestLogger)
         .on_response(ResponseLogger::default())
