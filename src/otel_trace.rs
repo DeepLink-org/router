@@ -1,11 +1,8 @@
 //! OpenTelemetry tracing integration.
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
-    },
-    time::Duration,
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, OnceLock,
 };
 
 use anyhow::Result;
@@ -17,7 +14,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::{BaggagePropagator, TraceContextPropagator},
     runtime,
-    trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler, Tracer as SdkTracer, TracerProvider},
+    trace::{BatchSpanProcessor, Sampler, Tracer as SdkTracer, TracerProvider},
     Resource,
 };
 use tracing::{Metadata, Subscriber};
@@ -394,14 +391,8 @@ pub fn prepare_otel(trace_config: &TraceConfig) -> Result<PreparedOtel> {
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create OTLP exporter: {e}"))?;
 
-    let batch_config = BatchConfigBuilder::default()
-        .with_scheduled_delay(Duration::from_millis(500))
-        .with_max_export_batch_size(64)
-        .build();
-
-    let span_processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
-        .with_batch_config(batch_config)
-        .build();
+    // Use the SDK's OTEL_BSP_* settings and defaults (5 s / 512 / 2048).
+    let span_processor = BatchSpanProcessor::builder(exporter, runtime::Tokio).build();
 
     // Filter SDK/environment resource attributes before filling Router identity.
     let resource = router_resource(Resource::default());

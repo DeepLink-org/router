@@ -35,7 +35,16 @@ values leave the attribute absent. The Router's HTTP response ID and P/D coordin
 retain their existing protocol semantics.
 `session.id` uses the explicit session header, or the OpenClaw session key when affinity is absent.
 The gateway can supply a normalized session ID for affinity routing. Health probes and LMDeploy
-worker registration endpoints are excluded by default. Span export uses the batch processor.
+worker registration endpoints are excluded by default. Span export uses the SDK batch processor.
+Completed spans are pushed asynchronously using the standard `OTEL_BSP_*` environment settings.
+Defaults are a 5-second scheduled delay (`OTEL_BSP_SCHEDULE_DELAY=5000`), a maximum batch of
+512 spans (`OTEL_BSP_MAX_EXPORT_BATCH_SIZE=512`) and a queue of 2,048 spans
+(`OTEL_BSP_MAX_QUEUE_SIZE=2048`). A full batch can be sent earlier. These settings are optional;
+the defaults align with vLLM's OpenTelemetry SDK configuration. Export delay does not change
+request timing or span timestamps. Collector buffering is configured separately.
+Five seconds is not an upper bound on delivery time or data loss on forced termination;
+queued spans, export retries and shutdown behavior also matter. The Rust SDK reads these
+settings and ignores values it cannot parse; LMDeploy validates its Python settings separately.
 For excluded routes that still forward an HTTP request, the backend CLIENT span inherits the
 incoming parent and sampling decision. Valid `tracestate` is forwarded as whole leftmost entries,
 limited to eight vendors and 512 bytes, including for unsampled requests. No local probability
@@ -48,7 +57,17 @@ With `OTEL_SERVICE_NAME=lmdeploy-router`, the Router exports inbound inference P
 `inference.engine=lmdeploy` and `inference.role=router`. The Router injects that span's
 context directly into backend inference requests. LMDeploy's HTTP request and measured phase
 spans can then reference the exported `model.router` span by ID. HTTP 5xx responses and
-transport failures set the Router span's OpenTelemetry status to ERROR.
+transport failures set the Router span's OpenTelemetry status to ERROR, including a backend
+response-body read failure after HTTP 200 headers and an initial SSE chunk. The HTTP status
+remains 200 because those headers have already been sent. The Router forwards the body error
+without buffering or parsing SSE; a clean transport EOF without a protocol terminal event is
+not classified by this middleware.
+Normally completed 4xx responses do not set ERROR, but a body transport failure does, including
+after 4xx headers. With OTel disabled, non-5xx responses skip end-of-stream error classification;
+existing HTTP status and service-error logging remain active.
+`latency_ms` measures request-to-response-headers time, or time to a service failure before
+headers. A body read failure preserves the recorded header latency. The full span duration
+also includes body processing; it is distinct from `latency_ms`.
 
 Other Router identities and other HTTP routes retain backend CLIENT spans, which measure
 the time to backend response headers.
